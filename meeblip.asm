@@ -627,7 +627,7 @@ TAB_VCA:
 ; main program loop that scans controls, receives MIDI commands and calculates envelope, 
 ; LFO, and DCA/DCF levels.
 ;
-; If you use too many clock cycles here, there won't be sufficient time left over for
+; If you use too many clock cycles here there won't be sufficient time left over for
 ; general housekeeping tasks. The result will be sluggish and lost notes, weird timing and sadness.
 ;-------------------------------------------------------------------------------------------------------------------
 
@@ -656,11 +656,11 @@ TIM2_CMP:
 ;
 ; Oscillator A & B 
 ;
-; This design uses the "direct frequency synthesis". A three-byte counter (= phase) is being
+; This design uses direct frequency synthesis. A three-byte counter (= phase) is being
 ; incremented by a value which is proportional to the sound frequency (= phase delta). The
-; increment takes place every sampling period, i.e. each 32uS. The most significant byte of
+; increment takes place every sampling period. The most significant byte of
 ; the counter is the sawtooth wave.  The square wave is a result of comparing the sawtooth wave to 128.
-; Each oscillator has its own "phase" and "phase delta" registers. The contents of each "phase delta" 
+; Each oscillator has its own phase and phase delta registers. The contents of each phase delta 
 ; register depends on the frequency being generated:
 ;
 ;                   PHASE DELTA = 2 ^ 24 * Freq / SamplingFreq
@@ -716,8 +716,8 @@ CALC_DCOB:
 ;-------------------------------------------------------------------------------------------------------------------
 ; Sum Oscillators
 ;
-; Combines DCOA (in r17)  and DCOB (in r16) waves. Convert both oscillators to 8-bit signed values, multiplies each by DCO scaling level
-; and sums them to produce a 16-bit signed result in HDAC:LDAC (r17:r16)
+; Combines DCOA (in r17) and DCOB (in r16) waves. Convert both oscillators to 8-bit signed values, multiplies each
+; by its DCO scaling level and sums them to produce a 16-bit signed result in HDAC:LDAC (r17:r16)
 ;
 ;------------------------------------------------------------------------------------------------------------------- 
 ; 
@@ -730,7 +730,7 @@ CALC_DCOB:
 			mulsu	r16, r22			; signed DCO B wave * level
 			add		r30, r0
 			adc 	r31, r1				; sum scaled waves
-  			sts 	WAVEB,r16				; store signed DCO B wave for fm 
+  			sts 	WAVEB,r16			; store signed DCO B wave for fm 
 			movw	r16, r30			; place signed output in HDAC:LDAC
 			movw	OSC_OUT_L, r16		; keep a copy for highpass filter
 
@@ -744,7 +744,7 @@ CALC_DCOB:
 ; a += f * ((in - a) + q * (a - b));
 ; b += f * (a - b); 
 ;
-; Input 16-Bit signed HDAC:LDAC (r17:r16), already scaled to minimize clipping.
+; Input 16-Bit signed HDAC:LDAC (r17:r16), already scaled to minimize clipping (reduced to 25% of full code).
 ;-------------------------------------------------------------------------------------------------------------------
 
                             		;calc (in - a) ; both signed
@@ -790,10 +790,10 @@ OVERFLOW_2:
 
 OVERFLOW_3:
         
-		lds		r18, MODEFLAGS2		; Check Lpw Pass/High Pass switch. 
+		lds		r18, MODEFLAGS2		; Check Low Pass/High Pass panel switch. 
 		sbrs 	r18, 3				
 		rjmp	CALC_LOWPASS						
-		movw    z_L,r20				; HP, so just load r21:r20 into z_H:z_L to disable Q 
+		movw    z_L,r20				; High Pass selected, so just load r21:r20 into z_H:z_L to disable Q 
 		rjmp	DCF_ADD				; Skip lowpass calc
 
 CALC_LOWPASS:
@@ -1057,7 +1057,7 @@ dco_fm:
 ;-------------------------------------------------------------------------------------------------------------------
 ; End of Sample Interrupt
 ;
-; Pop register values off stact and return to our regularly scheduled programming.
+; Pop register values off stack and return to our regularly scheduled programming.
 ;-------------------------------------------------------------------------------------------------------------------
 ; 
 
@@ -1868,7 +1868,7 @@ RESET:
 ; sample interrupt routine. When it's actually allowed to get down to work, it scans the panel switches every 100ms,
 ; scans the knobs a lot more than that, and calculates envelopes, LFO and parses MIDI input. 
 ; 
-; In its spare time, Main Program Loop likes to go for long walks, listens to classical music and enjoys 
+; In its spare time, Main Program Loop likes to go for long walks, listen to classical music and enjoy 
 ; existential bit flipping.
 ;-------------------------------------------------------------------------------------------------------------------
 ;
@@ -2048,16 +2048,15 @@ MLP_SKIPSCAN:
 		    rcall	ADC_START	        ; start conversion of next channel
 
 ;-------------------------------------------------------------------------------------------------------------------
-;
 ; Store knob values based on KNOB SHIFT switch setting
 ; 
 ; Pots 0, 1, 6, 7 have two parameters with the KNOB SHIFT
 ; switch used to select knob bank 0 or 1. When the switch is changed, the synth
 ; saves the current pot position and only updates the parameter in the new bank when
-; the knob has moved. Otherwise, allparameters would snap to the 
+; the knob has moved. Otherwise, all parameters would snap to the 
 ; current pot values when the shift switch is used.
 ;
-; To make things more challenging, the ADC value read from each pot might fluctuate between
+; To make things more challenging, the ADC value read from each pot might fluctuate
 ; through several values. This will cause the synth to think the pot has been moved and update
 ; the parameter value. To avoid this, require the pot to be moved a level of at least
 ; X before updating (deadzone check). To reduce processing time, a knob status byte
@@ -2373,7 +2372,7 @@ MIDI_VELOCITY:
 ;-------------------------------------------------------------------------------------------------------------------
 
 		lds    r18, RESONANCE
-        lds    r16, LPF_I    		;load 'F' value
+        lds    r16, LPF_I    			;load 'F' value
         ldi    r17, 0xff
 
         sub r17, r16 ; 1-F
@@ -2382,9 +2381,9 @@ MIDI_VELOCITY:
         add r17, r19
 
 
-        sub    r18, r17     		; Q-(1-f)
-        brcc REZ_OVERFLOW_CHECK      ; if no overflow occured
-        ldi    r18, 0x00    		;0x00 because of unsigned
+        sub    r18, r17     			; Q-(1-f)
+        brcc REZ_OVERFLOW_CHECK      	; if no overflow occured
+        ldi    r18, 0x00    			;0x00 because of unsigned
 
 REZ_OVERFLOW_CHECK:
 
