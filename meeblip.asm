@@ -1,21 +1,24 @@
 ;-------------------------------------------------------------------------------------------------------------------
-;	MeeBlip v1.03
-;   The Hackable Digital Synthesiser
+;	MeeBlip - The Hackable Digital Synthesiser
 ;
 ;Changelog
 ;
-;V1.03	 - VCA and VCF level tables extended to reduce stairstepping
-;V1.02	 - Flip DAC write line high immediately after outputting sample
-;V1.01	 - Optimized DCOA+DCOB summer, outputs signed value
-;V1.00   - Power/MIDI status LED remains on unless receiving MIDI
-;        - Sustain level of ADSR envelope is exponentially scaled
-;        - Non-resonant highpass filter implemented
-;        - Filter Q level compensation moved outside audio sample calc interrupt
-;        - Filter calculations increased to 16x8-bit to reduce noise floor
-;        - DCA output level calculations are rounded
-;        - Mod wheel no longer overrides LFO level knob when less than knob value
-;
-;V0.90   - Initial release 
+;V1.04 2011.01.19 - MIDI CC RAM table added.
+;		 		  - PWM waveform with dedicated fixed sweep LFO
+; 	     		  - 8-bit multiplies optimized in main loop
+;				  - LFO Sync switch now retriggers LFO on each keypress
+;				  - Initialize FM Depth to zero on power up
+;V1.03	 		  - VCA and VCF level tables extended to reduce stairstepping
+;V1.02	 		  - Flip DAC write line high immediately after outputting sample
+;V1.01	 		  - Optimized DCOA+DCOB summer, outputs signed value
+;V1.00   		  - Power/MIDI status LED remains on unless receiving MIDI
+;        		  - Sustain level of ADSR envelope is exponentially scaled
+;        		  - Non-resonant highpass filter implemented
+;        		  - Filter Q level compensation moved outside audio sample calc interrupt
+;        		  - Filter calculations increased to 16x8-bit to reduce noise floor
+;        		  - DCA output level calculations are rounded
+;        		  - Mod wheel no longer overrides LFO level knob when less than knob value
+;V0.90   		  - Initial release 
 ;
 ;-------------------------------------------------------------------------------------------------------------------
 ;
@@ -105,12 +108,14 @@ MIDINOTE:	        .BYTE 1
 MIDINOTEPREV:	    .BYTE 1		        ; buffer for MIDI note
 MIDIPBEND_L:        .BYTE 1		        ;\
 MIDIPBEND_H:        .BYTE 1		        ;/ -32768..+32766
-MIDIMODWHEEL:	    .BYTE 1		        ; 0..254
 
 ;current sound parameters:
 LFOFREQ:	        .BYTE 1	            ; 0..255
 LFOLEVEL:	        .BYTE 1	            ; 0..255
 PANEL_LFOLEVEL:		.BYTE 1				; 0..255 as read from the panel pot
+
+LFO2FREQ:			.BYTE 1
+
 
 
 KNOB_SHIFT:			.BYTE 1				; 0 = Bank 0 (lower), 1 = Bank 1 (upper)
@@ -212,11 +217,19 @@ ENVPHASE:	        .BYTE 1		        ; 0=stop 1=attack 2=decay 3=sustain 4=release
 ENV_FRAC_L:	        .BYTE 1
 ENV_FRAC_H:	        .BYTE 1
 ENV_INTEGR:	        .BYTE 1
+
 LFOPHASE:	        .BYTE 1		        ; 0=up 1=down
 LFO_FRAC_L:	        .BYTE 1		        ;\
 LFO_FRAC_H:	        .BYTE 1		        ; > -128,000..+127,999
 LFO_INTEGR:	        .BYTE 1		        ;/
 LFOVALUE:	        .BYTE 1		        ; -128..+127
+
+LFO2PHASE:	        .BYTE 1		        ; 0=up 1=down
+LFO2_FRAC_L:	    .BYTE 1		        ;\
+LFO2_FRAC_H:	    .BYTE 1		        ; > -128,000..+127,999
+LFO2_INTEGR:	    .BYTE 1		        ;/
+LFO2VALUE:	        .BYTE 1		        ; -128..+127
+
 OLDWAVEA:	        .BYTE 1
 OLDWAVEB:	        .BYTE 1
 SHIFTREG_0:	        .BYTE 1		        ;\
@@ -228,6 +241,12 @@ LFOBOTTOM_2:        .BYTE 1		        ;/
 LFOTOP_0:	        .BYTE 1		        ;\
 LFOTOP_1:	        .BYTE 1		        ; > top level of LFO
 LFOTOP_2:	        .BYTE 1		        ;/
+LFO2BOTTOM_0:       .BYTE 1		        ;\
+LFO2BOTTOM_1:       .BYTE 1		        ; > bottom level of LFO2
+LFO2BOTTOM_2:       .BYTE 1		        ;/
+LFO2TOP_0:	        .BYTE 1		        ;\
+LFO2TOP_1:	        .BYTE 1		        ; > top level of LFO2
+LFO2TOP_2:	        .BYTE 1		        ;/
 
 DCOA_LEVEL:			.BYTE 1
 DCOB_LEVEL:			.BYTE 1
@@ -244,6 +263,9 @@ DELTAB_0: .byte 1
 DELTAB_1: .byte 1
 DELTAB_2: .byte 1
 
+; oscillator pulse width
+PULSE_WIDTH: .byte 1
+
 ; fm
 WAVEB:	  .byte 1
 FMDEPTH:  .byte 1
@@ -253,6 +275,22 @@ RESONANCE:	.byte 1
 SCALED_RESONANCE: .byte 1
 b_L:		.byte 1
 b_H:		.byte 1
+
+
+;-------------------------------------------------------------------------------------------------------------------
+; MIDI Control Change parameter table
+;-------------------------------------------------------------------------------------------------------------------
+;
+; Add your own MIDI CC parameters here with an offset from MIDICC. They will be automatically
+; stored for use. 
+ 
+
+MIDICC:         	.byte $80 
+  .equ MIDIMODWHEEL = MIDICC + $01
+  .equ PWMDEPTH 	= MIDICC + $30
+
+;-------------------------------------------------------------------------------------------------------------------
+
 
 
 ;stack: 0x0A3..0x25F
@@ -694,10 +732,17 @@ TIM2_CMP:
 
 
 CALC_DCOA:
-		    mov	    R17, PHASEA_2
-		    rol	    R17			        ; R17.7 --> Cy
-		    sbc	    R17, R17	        ; R17 = 0 or 255 (square wave)
-		    sbrs	R30, 1			    ; 0/1 (DCO A = saw/squ)
+		    mov	    R17, PHASEA_2		; sawtooth ramp for OSCA
+;PWM wave
+			lds		R22, PULSE_WIDTH	
+			cp		R17, R22			
+			brlo	PULSE_ZERO	
+			ldi		R17, 255
+			rjmp	SAW_CHECK
+PULSE_ZERO:
+			ldi		R17, 0
+SAW_CHECK:
+			sbrs	R30, 1			    ; 0/1 (DCO A = saw/squ)
 		    mov	    R17, PHASEA_2	    ; only when sawtooth
 
 ;Calculate DCO B
@@ -708,6 +753,8 @@ CALC_DCOB:
 		    sbrs	R30, 2			    ; 0/1 (DCO B = saw/squ)
 		    mov	    R16, PHASEB_2	    ; only when sawtooth
 
+
+CALC_DIST:
 			sbrc	R30, 0			    ; 0/1 (OSC DIST = off/on)
     		eor	    R17, R16
 		    sbrs	R30, 3
@@ -1235,10 +1282,22 @@ INTRX_CC2:
             dec     R17			        ;\
 		    sts	    MIDIPHASE, R17		;/ MIDIPHASE = 0xB0
 		    lds	    R17, MIDIDATA0
-		    cpi	    R17, 1
-		    brne	INTRX_EXIT		    ; skip if not MODWHEEL
-		    lsl	    R16
-		    sts	    MIDIMODWHEEL, R16
+
+;Store MIDI CC in table
+			push 	r26					; store contents of r27 and r26 on stack
+			push	r27
+
+			ldi 	r26,low(MIDICC)			
+  			ldi 	r27,high(MIDICC)
+  			add 	r26,r17
+  			adc 	r27,zero
+  			lsl 	r16					; shift MIDI data to 0..254 to match knob value
+  			st 		x,r16				; store in MIDI CC table
+
+			pop		r27					; reload old contents of r27 and r 26
+			pop		r26
+
+
 		    rjmp	INTRX_EXIT
 
 ;Ex pitch bender:
@@ -1432,7 +1491,8 @@ MUL8X8S:
             bst	    R16, 7			    ; T = sign: 0=plus, 1=minus
 		    sbrc	R16, 7			    ;\
 		    neg	    R16			        ;/ R16 = abs(R16)	0..128
-		    rcall	MUL8X8U			    ; R17,R16 = LFO * LFOMOD
+			mul		r16, r17
+			movw 	r16,r0			    ; R17,R16 = LFO * LFOMOD
 		    brtc	M8X8S_EXIT		    ; exit if x >= 0
 		    com	    R16			        ;\
 		    com	    R17			        ; \
@@ -1720,6 +1780,7 @@ RESET:
 			ldi		R16, 5
 			sts 	KNOB_DEADZONE, R16	
 		    ldi	    R16, 0
+			sts		FMDEPTH, R16		; FM Depth = 0
 			sts		RESONANCE, R16		; Resonance = 0
 			sts		PORTAMENTO, R16		; Portamento = 0
 		    sts	    GATE, R16		    ; GATE = 0
@@ -1753,18 +1814,27 @@ RESET:
     		ldi	    R17, 0			    ; > Amin = 0
 		    ldi	    R18, 0			    ;/
 		    sts	    LFOBOTTOM_0, R16	;\
-		    sts	    LFOBOTTOM_1, R17	; > store Amin
+		    sts	    LFOBOTTOM_1, R17	; > store Amin for LFO
 		    sts	    LFOBOTTOM_2, R18	;/
+			ldi		R18, 23
+			sts	    LFO2BOTTOM_0, R16	;\
+		    sts	    LFO2BOTTOM_1, R17	; > store Amin for LFO2
+			sts	    LFO2BOTTOM_2, R18	;/
 		    ldi	    R16, 255		    ;\
 		    ldi	    R17, 255		    ; > Amax = 255,999
 		    ldi	    R18, 255		    ;/
 		    sts	    LFOTOP_0, R16		;\
-		    sts	    LFOTOP_1, R17		; > store Amax
+		    sts	    LFOTOP_1, R17		; > store Amax for LFO
 		    sts	    LFOTOP_2, R18		;/
+			ldi		R18, 225
+			sts	    LFO2TOP_0, R16		;\
+		    sts	    LFO2TOP_1, R17		; > store Amax for LFO2
+		    sts	    LFO2TOP_2, R18		;/
 
 ;initialize sound parameters:
 		    ldi	    R16,0
 		    sts	    LFOPHASE, R16		;
+			sts	    LFO2PHASE, R16		;
 		    sts	    ENVPHASE, R16		;
 		    sts	    DETUNEB_FRAC, R16	;\
 		    sts	    DETUNEB_INTG, R16	;/ detune = 0
@@ -1772,6 +1842,8 @@ RESET:
 		    sts	    VCFENVMOD, R16		;
 		    ldi	    R16, 84			    ;\
 		    sts	    LFOFREQ, R16	    ;/
+			ldi	    R16, 4				;\ Set LFO to slow sweep for PWM modulation	
+			sts	    LFO2FREQ, R16	    ;/
 		    ldi	    R16, 0x18    		;\
 		    sts	    MODEFLAGS1, R16		;/ DCO B = on, DCA = env
 		    ldi	    R16, 0x10    		;\ LFO = DCO
@@ -1855,7 +1927,7 @@ RESET:
 		    lds	    R18, ADC_CHAN
 		    rcall	ADC_START
 
-;initialize the keyboard scan time 050419:
+;initialize the keyboard scan time 
 		    in	R16, TCNT1L		        ;\
 		    in	R17, TCNT1H		        ;/ R17:R16 = TCNT1 = t
 		    sts	TPREV_KBD_L, R16
@@ -1953,7 +2025,7 @@ MLP_SWLOOP:
 		    bld	    R18, 0		        ;/ PD7.PB0. SW13 DCO Distortion off/on
 
 		    bst	    R16, 4		        ;\
-    		bld	    R19, 2		        ;/ PD4.PB1. SW12 LFO keyboard sync off/on
+    		bld	    R19, 6		        ;/ PD4.PB1. SW12 LFO keyboard sync off/on
 
 		    bst	    R16, 5		        ;\
 		    bld	    R19, 0		        ;/ PD5.PB1. SW11 LFO Mode 0=DCF, 1 = DCO
@@ -2143,8 +2215,10 @@ DEAD_CHECK_60:
 ; Knob 6 --> FM depth 
 ;-------------------------------------------------------------------------------------------------------------------
 
-LOAD_ADC_60:	
-		    sts	    FMDEPTH,R16			
+LOAD_ADC_60:
+
+		    sts	    FMDEPTH, R16			
+
 ;-------------------------------------------------------------------------------------------------------------------
 
 KNOB_70:
@@ -2371,23 +2445,23 @@ MIDI_VELOCITY:
 ; Doing this here to get it out of the sample loop
 ;-------------------------------------------------------------------------------------------------------------------
 
-		lds    r18, RESONANCE
-        lds    r16, LPF_I    			;load 'F' value
-        ldi    r17, 0xff
+   	 	 lds    r18, RESONANCE
+         lds    r16, LPF_I    			;load 'F' value
+         ldi    r17, 0xff
 
-        sub r17, r16 ; 1-F
-        lsr r17
-        ldi r19, 0x04
-        add r17, r19
+         sub r17, r16 ; 1-F
+         lsr r17
+         ldi r19, 0x04
+         add r17, r19
 
 
-        sub    r18, r17     			; Q-(1-f)
-        brcc REZ_OVERFLOW_CHECK      	; if no overflow occured
-        ldi    r18, 0x00    			;0x00 because of unsigned
+         sub    r18, r17     			; Q-(1-f)
+         brcc REZ_OVERFLOW_CHECK      	; if no overflow occured
+         ldi    r18, 0x00    			;0x00 because of unsigned
 
 REZ_OVERFLOW_CHECK:
 
-		sts	   SCALED_RESONANCE, r18
+  		 sts	   SCALED_RESONANCE, r18
 
 
             ;-------------
@@ -2548,6 +2622,87 @@ MLP_LFOLWR:
             sts	    LFOLEVEL, R16
 
 MLP_LFOMWX:
+
+            ;----
+            ;LFO2 (Used to sweep PWM waveform)
+            ;----
+
+;calculate dA:
+		    lds	    R16, LFO2FREQ	    ;\
+		    com	    R16			        ;/ R16 = 255 - ADC0
+		    rcall	ADCTORATE           ; R19:R18:R17:R16 = rate of rise/fall
+		    lds	    R22, DELTAT_L		;\
+    		lds	    R23, DELTAT_H		;/ R23:R22 = dT
+		    rcall	MUL32X16		    ; R18:R17:R16 = dA
+		    lds	    R19, LFO2_FRAC_L
+		    lds	    R20, LFO2_FRAC_H
+    		lds	    R21, LFO2_INTEGR
+		    subi    R21, 128
+		    ldi	    R31, 0			    ; flag = 0
+		    lds	    R30, LFO2PHASE
+		    tst	    R30
+		    brne	MLP_LFO2FALL
+
+;rising phase:
+
+MLP_LFO2RISE:
+            lds	    R22, LFO2TOP_0		;\
+		    lds	    R23, LFO2TOP_1		; > R24:R23:R22 = Amax
+		    lds	    R24, LFO2TOP_2		;/
+		    add	    R19, R16		    ;\
+    		adc	    R20, R17		    ; > A += dA
+		    adc	    R21, R18		    ;/
+		    brcs	MLP_LFO2TOP
+		    cp	    R19, R22		    ;\
+		    cpc	    R20, R23		    ; > A - Amax
+		    cpc	    R21, R24		    ;/
+		    brlo	MLP_LFO2X		    ; skip when A < Amax
+
+;A reached top limit:
+
+MLP_LFO2TOP:
+            mov	    R19, R22		    ;\
+		    mov	    R20, R23		    ; > A = Amax
+		    mov	    R21, R24		   	;/
+		    ldi	    R30, 1			    ; begin of falling
+		    ldi	    R31, 1			    ; flag = 1
+		    rjmp	MLP_LFO2X
+
+;falling phase:
+
+MLP_LFO2FALL:
+            lds	    R22, LFO2BOTTOM_0	;\
+		    lds	    R23, LFO2BOTTOM_1	; > R24:R23:R22 = Amin
+		    lds	    R24, LFO2BOTTOM_2	;/
+    		sub	    R19, R16		    ;\
+		    sbc	    R20, R17		    ; > A -= dA
+		    sbc	    R21, R18		    ;/
+		    brcs	MLP_LFO2BOTTOM
+		    cp	    R22, R19		    ;\
+		    cpc	    R23, R20		    ; > Amin - A
+		    cpc 	R24, R21		    ;/
+		    brlo	MLP_LFO2X		    ; skip when A > Amin
+
+;A reached bottom limit:
+
+MLP_LFO2BOTTOM:
+            mov	    R19, R22		    ;\
+		    mov	    R20, R23		    ; > A = Amin
+		    mov	    R21, R24		    ;/
+		    ldi	    R30, 0			    ; begin of rising
+		    ldi	    R31, 1			    ; flag = 1
+
+MLP_LFO2X:
+            sts	    LFO2PHASE, R30
+		    subi	R21, 128		    ; R21,R20:R19 = LFO2 tri wave
+		    sts	    LFO2_FRAC_L, R19	;\
+		    sts	    LFO2_FRAC_H, R20	; > store LFO2 value
+    		sts	    LFO2_INTEGR, R21	;/
+
+			subi	r21, $80			; remove sign
+            sts	    PULSE_WIDTH, R21	; Update pulse width value
+
+
 			;----
             ;ENV:
             ;----
@@ -2668,14 +2823,17 @@ MLP_KEYON1:
 		    ldi	    R16, 1			    ;\
 		    sts	    ENVPHASE, R16		;/ attack
 		    ldi	    R16, 0
-		    sts	    ENV_FRAC_L, R16		;\
+
+			sts	    ENV_FRAC_L, R16		;\
 		    sts	    ENV_FRAC_H, R16		; > ENV = 0
 		    sts	    ENV_INTEGR, R16		;/
 
+; xyzzy - LFO keyboard sync check
+
 ; LFO starts (only when LFO KBD SYNC = on):
 		    lds	    R16, MODEFLAGS2
-		    andi	R16, 0x40
-		    breq	MLP_NOTEON		    ; skip when LFO KBD SYNC = off
+		    sbrs 	R16,6			
+		    rjmp	MLP_NOTEON		    ; skip when LFO KBD SYNC = off
 		    ldi	    R16, 255		    ;\
 		    ldi	    R17, 255		    ; > A = Amax
 		    ldi	    R18, 127		    ;/
@@ -2909,7 +3067,8 @@ MLP_DCF0:
 ;ENV mod:
             lds	    R16, ENV_INTEGR
 		    lds	    R17, VCFENVMOD
-		    rcall	MUL8X8U			    ; R17,R16 = ENV * ENVMOD
+			mul		r16, r17
+			movw 	r16,r0				; R17,R16 = ENV * ENVMOD		    
     		rol	    R16			        ; Cy = R16.7 (for rounding)
 		    adc	    R30, R17
 		    adc	    R31, ZERO
@@ -2922,6 +3081,7 @@ MLP_DCF0:
 		    lsl	    R16			        ; R16 = 2*n (24/octave)	0..192
 		    subi	R16, 96	        	; R16 = 2*(n-48) (24/octave)   -96..+96
 		    ldi	    R17, 171
+
 		    rcall	MUL8X8S		        ; R17 = 1,5*(n-48) (16/octave) -64..+64
 		    ldi	    R18, 0			    ;\
 		    sbrc	R17, 7			    ; > R18 = sign extension
