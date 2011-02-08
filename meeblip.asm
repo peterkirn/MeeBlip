@@ -3,6 +3,8 @@
 ;
 ;Changelog
 ;
+;
+;V1.05 2011.02.04 - Save dual parameter knob values to eeprom and reload on power up.
 ;V1.04 2011.01.19 - MIDI CC RAM table added.
 ;		 		  - PWM waveform with dedicated fixed sweep LFO
 ; 	     		  - 8-bit multiplies optimized in main loop
@@ -118,7 +120,8 @@ LFO2FREQ:			.BYTE 1
 
 
 
-KNOB_SHIFT:			.BYTE 1				; 0 = Bank 0 (lower), 1 = Bank 1 (upper)
+KNOB_SHIFT:			.BYTE 1				; 0 = Bank 0 (lower), 1 = Bank 1 (upper). 
+POWER_UP:			.BYTE 1				; 255 = Synth just turned on, 0 = normal operation
 KNOB_STATUS:		.BYTE 1				; Each bit corresponds to a panel knob.
 										; 0 = pot not updated since Knob Shift switch change
 										; 1 = pot has been updated. 
@@ -269,6 +272,10 @@ PULSE_WIDTH: .byte 1
 ; fm
 WAVEB:	  .byte 1
 FMDEPTH:  .byte 1
+
+; eeprom 
+WRITE_MODE:	.byte 1
+WRITE_OFFSET:	.byte 1
 
 ; filter
 RESONANCE:	.byte 1
@@ -1744,6 +1751,48 @@ NLP_CONT:
 		    adc	    R17, R31
 		    ret
 
+;-----------------------------------------------------------------------------
+; Write byte to eeprom memory
+;- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+;In:	    R16 	= value		                0..255
+;			r18:r17 = eeprom memory address
+;Used:	    R16, R17, R18
+;-----------------------------------------------------------------------------
+EEPROM_write:
+										; Wait for completion of previous write
+			sbic 	EECR,EEWE
+			rjmp 	EEPROM_write
+										; Set up address (r18:r17) in address register
+			out 	EEARH, r18 
+			out 	EEARL, r17
+										; Write data (r16) to data register
+			out 	EEDR,r16
+										; Write logical one to EEMWE
+			sbi 	EECR,EEMWE
+										; Start eeprom write by setting EEWE
+			sbi 	EECR,EEWE
+			ret
+
+;-----------------------------------------------------------------------------
+; Read byte from eeprom memory
+;- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+;In:	    r18:r17 = eeprom memory address
+;Out:		r16 	= value		                0..255
+;Used:	    R16, R17, R18
+;-----------------------------------------------------------------------------
+EEPROM_read:
+										; Wait for completion of previous write
+			sbic 	EECR,EEWE
+			rjmp 	EEPROM_read
+										; Set up address (r18:r17) in address register
+			out 	EEARH, r18
+			out 	EEARL, r17
+										; Start eeprom read by writing EERE
+			sbi 	EECR,EERE
+										; Read data from data register
+			in 		r16,EEDR
+			ret
+
 ;-------------------------------------------------------------------------------------------------------------------
 ;			M A I N   P R O G R A M
 ;-------------------------------------------------------------------------------------------------------------------
@@ -1800,6 +1849,7 @@ RESET:
 		    sts	    PORTACNT, R16	    ; PORTACNT = 2
 		    ldi	    R16, 255
 			sts		KNOB_SHIFT, R16		; Initialize panel shift knob in unknown state to force update
+			sts		POWER_UP, R16		; Set power_up flag to 255 to force first initialization of panel switches
 		    sts	    LPF_I, R16		    ; no DCF
 			sts		HPF_I, R16			
 		    sts	    MIDINOTE, R16	    ; note# = 255
@@ -1831,8 +1881,13 @@ RESET:
 		    sts	    LFO2TOP_1, R17		; > store Amax for LFO2
 		    sts	    LFO2TOP_2, R18		;/
 
+
 ;initialize sound parameters:
 		    ldi	    R16,0
+			sts		WRITE_OFFSET, R16	; Initialize eeprom offset
+			sts		WRITE_MODE, R17		; Initialize eeprom WRITE_MODE to "No Write" (255)
+
+			sts		KNOB_STATUS, R16	; No knobs have been moved yet
 		    sts	    LFOPHASE, R16		;
 			sts	    LFO2PHASE, R16		;
 		    sts	    ENVPHASE, R16		;
@@ -1853,7 +1908,42 @@ RESET:
 			sts		DECAYTIME, R16		
 			sts		SUSTAINLEVEL, R16
 		    sts	    RELEASETIME, R16	
-			
+
+; Load saved knob parameter values from eeprom
+
+			in 		r16, SREG 			; store SREG value
+			ldi		r18, 0
+			ldi		r17, 0				; Set eeprom memory offset to zero, then read 10 bytes...
+			rcall	EEPROM_read
+			sts 	DCOA_LEVEL, r16
+			inc		r17
+			rcall	EEPROM_read
+			sts		DCOB_LEVEL, r16
+			inc		r17
+			rcall	EEPROM_read
+			sts		DETUNEB_FRAC, r16
+			inc		r17
+			rcall	EEPROM_read
+			sts 	DETUNEB_INTG, r16
+			inc		r17
+			rcall	EEPROM_read
+			sts		CUTOFF, r16
+			inc		r17
+			rcall	EEPROM_read
+			sts		RESONANCE, r16
+			inc		r17
+			rcall	EEPROM_read
+			sts		PORTAMENTO, r16
+			inc		r17
+			rcall	EEPROM_read
+			sts		FMDEPTH, r16
+			inc		r17
+			rcall	EEPROM_read
+			sts		PANEL_LFOLEVEL, r16
+			inc		r17
+			rcall	EEPROM_read
+			sts		LFOFREQ, r16
+			out 	SREG, r16 				; restore SREG value (I-bit)
 
 ;initialize port A:
 		    ldi	    R16, 0x00    		;\
@@ -1927,6 +2017,56 @@ RESET:
 		    lds	    R18, ADC_CHAN
 		    rcall	ADC_START
 
+;store initial pot positions as OLD_ADC values to avoid snapping to new value unless knob has been moved.
+
+										; Store value of Pot ADC0
+		    rcall	ADC_END			    ; R16 = AD(i)
+		    lds	    R18, ADC_CHAN		;\
+		    ldi	    R28, ADC_0		    ; \
+		    add	    R28, R18		    ; / Y = &ADC_i
+		    ldi	    R29, 0			    ;/
+		    st	    Y, R16			    ; AD(i) --> ADC_i
+
+		    inc	    R18					; Now do ADC1
+		    rcall	ADC_START	        ; start conversion of next channel
+			
+			rcall	ADC_END			    ; R16 = AD(i)
+		    ldi	    R28, ADC_0		    ; \
+		    add	    R28, R18		    ; / Y = &ADC_i
+		    ldi	    R29, 0			    ;/
+		    st	    Y, R16			    ; AD(i) --> ADC_i
+			
+			ldi	    R18, 6				; Now do ADC6
+		    rcall	ADC_START	        ; start conversion of next channel
+			
+			rcall	ADC_END			    ; R16 = AD(i)
+		    ldi	    R28, ADC_0		    ; \
+		    add	    R28, R18		    ; / Y = &ADC_i
+		    ldi	    R29, 0			    ;/
+		    st	    Y, R16			    ; AD(i) --> ADC_i
+
+			inc	    R18					; Now do ADC7
+		    rcall	ADC_START	        ; start conversion of next channel
+			
+			rcall	ADC_END			    ; R16 = AD(i)
+		    ldi	    R28, ADC_0		    ; \
+		    add	    R28, R18		    ; / Y = &ADC_i
+		    ldi	    R29, 0			    ;/
+		    st	    Y, R16			    ; AD(i) --> ADC_i
+			ldi		R18, 2
+			sts	    ADC_CHAN,R18
+		    rcall	ADC_START	        ; start conversion of ADC2 
+
+			lds	    R16, ADC_0			; Save dual knob positions for future comparison (ADC0, 1, 6, 7)
+			sts	    OLD_ADC_0,R16
+			lds	    R16, ADC_1			 
+			sts	    OLD_ADC_1,R16
+			lds	    R16, ADC_6			 
+			sts	    OLD_ADC_6,R16
+			lds	    R16, ADC_7			 
+			sts	    OLD_ADC_7,R16	
+
+
 ;initialize the keyboard scan time 
 		    in	R16, TCNT1L		        ;\
 		    in	R17, TCNT1H		        ;/ R17:R16 = TCNT1 = t
@@ -1961,7 +2101,7 @@ MAINLOOP:
 		    subi	R16, LOW(KBDSCAN)	;\
 		    sbci	R17, HIGH(KBDSCAN)	;/ R17:R16 = (t-t0) - 100ms
 		    brsh	MLP_SCAN		    ;\
-		    rjmp	MLP_SKIPSCAN		;/ skip scanning if (t-t0) < 100ms
+		    rjmp	MLP_WRITE			;/ skip scanning if (t-t0) < 100ms
 
 MLP_SCAN:
             in	    R16, TCNT1L
@@ -2070,33 +2210,185 @@ MLP_SWLOOP:
 
 ; Check if knob shift switch has changed:
 
+; At power up, set previous knob shift value to current switch setting and jump tp read knobs
+			lds		R17, POWER_UP		; Is this the first time through this code since synth was turned on?
+			sbrs	R17, 0				; No: skip to read the 'knob shift' switch and see if it's changed.
+			rjmp	MLP_SHIFT			
+			sbrs	R19, 4				; Yes: Store current knob shift switch value as previous value
+			ldi		R16, 0				; Test if 'knob shift' bit is set
+			sbrc	R19, 4
+			ldi		R16, 1
+			sts		KNOB_SHIFT, R16		 
+			clr		R17					
+			sts		POWER_UP, R17		; Clear the POWER_UP flag so we don't reinitialize
+			rjmp	MLP_WRITE			; and skip switch check this time
+
+MLP_SHIFT:
 			sbrs	R19, 4				; Test if 'knob shift' bit is set
 			ldi		R16, 0
 			sbrc	R19, 4
 			ldi		R16, 1
 			lds		R17, KNOB_SHIFT
 			cp		R16, R17
-			breq	MLP_SKIPSCAN		; skip if unchanged
+			brne	MLP_SWITCHSCAN
+			rjmp	MLP_WRITE			; skip if switch unchanged
 
-			sts		KNOB_SHIFT, R16		; Store new position of shift switch
+MLP_SWITCHSCAN:
+			sts		KNOB_SHIFT, R16		; Store new position of shift switch and write knob parameters to eeprom. 
+		
+										; If shift switch is down, write upper parameters to eeprom
+			sbrc	R19, 4
+			rjmp	SWITCH_UP
+			ldi		r16, 1				;
+			sts		WRITE_MODE, r16		; Select the upper bank to write to eeprom
+			ldi		r16, 0				; eeprom byte offset is zero
+			sts		WRITE_OFFSET, r16
+			rjmp	EXIT_EEPROM						
+
+SWITCH_UP:								
+			ldi		r16, 0				;
+			sts		WRITE_MODE, r16		; If shift switch is up, select lower bank for eeprom write
+			ldi		r16, 6
+			sts		WRITE_OFFSET, r16	; eeprom offset is 6 (7th byte)
+
+EXIT_EEPROM:
 			clr		R16
 			sts		KNOB_STATUS,R16		; Clear status bits to indicate no knobs have changed
-			lds	    R16, ADC_0			; Save current pot positions for future comparison
+			lds	    R16, ADC_0			; Save current pot 0, 1, 6 and 7 positions for future comparison
 			sts	    OLD_ADC_0,R16
 			lds	    R16, ADC_1			 
 			sts	    OLD_ADC_1,R16
-			lds	    R16, ADC_2			 
-			sts	    OLD_ADC_2,R16
-			lds	    R16, ADC_3			 
-			sts	    OLD_ADC_3,R16
-			lds	    R16, ADC_4
-			sts	    OLD_ADC_4,R16
-			lds	    R16, ADC_5			 
-			sts	    OLD_ADC_5,R16
 			lds	    R16, ADC_6			 
 			sts	    OLD_ADC_6,R16
 			lds	    R16, ADC_7			 
 			sts	    OLD_ADC_7,R16	
+
+; ------------------------------------------------------------------------------------------------------------------------
+; Asynchronous EEPROM write
+;
+; Because EEPROM writes are slow, MeeBlip executes the main program and audio interrupts while eeprom writes happen in the 
+; background. A new byte is only written if the eeprom hardware flags that it's finished the previous write. 
+; ------------------------------------------------------------------------------------------------------------------------
+; 
+	
+MLP_WRITE:
+			lds		r16, WRITE_MODE
+			sbrc	r16,7			
+			rjmp	MLP_SKIPSCAN		; Nothing to write, so skip
+
+			sbic 	EECR,EEWE
+			rjmp	MLP_SKIPSCAN		; Skip if we're not finished the last write
+			sbrc	r16, 0	
+			rjmp	WRITE_UPPER
+
+; ------------------------------------------------------------------------------------------------------------------------
+; Load a single lower knob bank value for eeprom
+; ------------------------------------------------------------------------------------------------------------------------
+; 	
+			lds		r16, WRITE_OFFSET
+			cpi		r16, 6
+			breq	WRITE_GLIDE
+			cpi		r16, 7
+			breq	WRITE_FM
+			cpi		r16, 8
+			breq	WRITE_LFODEPTH
+
+; LFOFREQ
+			lds		r17, LFOFREQ		; Fetch LFO Speed value									
+			rjmp	WRITE_BYTE
+
+WRITE_GLIDE:
+			lds		r17, PORTAMENTO		; Fetch glide value									
+			rjmp	WRITE_BYTE
+
+WRITE_FM:
+			lds		r17, FMDEPTH		; Fetch FM value									
+			rjmp	WRITE_BYTE
+
+WRITE_LFODEPTH:
+			lds		r17, PANEL_LFOLEVEL	; Fetch LFO depth value									
+			rjmp	WRITE_BYTE
+
+
+; ------------------------------------------------------------------------------------------------------------------------
+; Load a single upper knob bank value for eeprom
+; ------------------------------------------------------------------------------------------------------------------------
+; 
+
+WRITE_UPPER:							
+			lds		r16, WRITE_OFFSET
+			cpi		r16, 0
+			breq	WRITE_DCOA
+			cpi		r16, 1
+			breq	WRITE_DCOB
+			cpi		r16, 2
+			breq	WRITE_DETUNEF
+			cpi		r16, 3
+			breq	WRITE_DETUNEI
+			cpi		r16, 4
+			breq	WRITE_CUTOFF
+
+; Resonance
+			lds		r17, RESONANCE		; Fetch filter resonance
+			rjmp	WRITE_BYTE		
+									
+WRITE_DCOA:
+			lds		r17, DCOA_LEVEL		; Fetch DCO A volume									
+			rjmp	WRITE_BYTE				
+
+WRITE_DCOB:
+			lds		r17, DCOB_LEVEL 	; Fetch DCO B volume
+			rjmp	WRITE_BYTE	
+
+WRITE_DETUNEF:
+			lds		r17, DETUNEB_FRAC	; Fetch DCO B fractional detune value
+			rjmp	WRITE_BYTE	
+
+WRITE_DETUNEI:
+			lds		r17, DETUNEB_INTG	; Fetch DCO B integer detune value
+			rjmp	WRITE_BYTE	
+
+WRITE_CUTOFF:
+			lds		r17, CUTOFF			; Fetch filter cutoff
+								
+
+; ------------------------------------------------------------------------------------------------------------------------ 
+; Store a single parameter value to eeprom
+; ------------------------------------------------------------------------------------------------------------------------
+;
+										
+WRITE_BYTE:								
+									
+			ldi		r19, 0														
+			out 	EEARH, r19 
+			out 	EEARL, r16			; single byte offset from WRITE_OFFSET
+			out 	EEDR,r17			; Write data (r17) to data register
+			in 		r17, SREG 			; store SREG value
+			cli 						; disable interrupts during timed eeprom write sequence
+			sbi 	EECR,EEMWE			; Write logical one to EEMWE
+			sbi 	EECR,EEWE			; Start eeprom write by setting EEWE
+			out 	SREG, r17 			; restore SREG value (I-bit)
+			sei 						; set global interrupt enable
+
+			cpi		r16, 5				; If eeprom write offset is at the end of knob bank 0 or bank 1, turn off write mode
+			breq	CLEAR_WRITE
+			cpi		r16, 9
+			breq 	CLEAR_WRITE
+			inc		r16
+			sts		WRITE_OFFSET, r16 	; increment and store eeprom offset for next parameter
+			rjmp	MLP_SKIPSCAN
+
+CLEAR_WRITE:
+			ldi		r17, 0
+			sts		WRITE_OFFSET, r17	; Set offset to zero
+			ldi		r17, 255
+			sts		WRITE_MODE, r17		; Set write mode to 255 (off)
+
+
+; ------------------------------------------------------------------------------------------------------------------------
+; Read potentiometer values
+; ------------------------------------------------------------------------------------------------------------------------
+;
 
 
 MLP_SKIPSCAN:
@@ -2118,7 +2410,7 @@ MLP_SKIPSCAN:
 		    andi	R18, 0x07
 		    sts	    ADC_CHAN,R18
 		    rcall	ADC_START	        ; start conversion of next channel
-
+			
 ;-------------------------------------------------------------------------------------------------------------------
 ; Store knob values based on KNOB SHIFT switch setting
 ; 
@@ -2135,7 +2427,6 @@ MLP_SKIPSCAN:
 ; tracks whether the pots have been moved since the KNOB SHIFT switch was updated.
 ; If the status bit is set, we can just skip the deadzone check and update.		
 ;-------------------------------------------------------------------------------------------------------------------
-
 
 ; Check which bank of knob parameters we're updating.
 
@@ -2186,7 +2477,7 @@ KNOB_10:
 DEAD_CHECK_10:
 			cpi		R19, 5				
 			brlo	KNOB_60			
-			sbr 	r18,1				
+			sbr 	r18,2				
 
 ;-------------------------------------------------------------------------------------------------------------------
 ; Knob 1 --> LFO depth 
@@ -2209,7 +2500,7 @@ KNOB_60:
 DEAD_CHECK_60:
 			cpi		R19, 5				
 			brlo	KNOB_70			
-			sbr 	r18,1				
+			sbr 	r18,64				
 
 ;-------------------------------------------------------------------------------------------------------------------
 ; Knob 6 --> FM depth 
@@ -2233,7 +2524,7 @@ KNOB_70:
 DEAD_CHECK_70:
 			cpi		R19, 5							
 			brlo	EXIT_KNOB_BANK_0						
-			sbr 	r18,1				
+			sbr 	r18,128				
 
 ;-------------------------------------------------------------------------------------------------------------------
 ; Knob 7 --> Portamento (key glide) 
@@ -2295,7 +2586,7 @@ KNOB_11:
 DEAD_CHECK_11:
 			cpi		R19, 5	; 
 			brlo	KNOB_61						
-			sbr 	r18,1						
+			sbr 	r18,2						
 
 ;-------------------------------------------------------------------------------------------------------------------
 ; Knob 1 --> DCF cutoff (F)
@@ -2317,7 +2608,7 @@ KNOB_61:
 DEAD_CHECK_61:
 			cpi		R19, 5	; 
 			brlo	KNOB_71						
-			sbr 	r18,1						
+			sbr 	r18,64						
 
 ;-------------------------------------------------------------------------------------------------------------------
 ; Knob 6 --> DCO B detune with non-linear knob (center is tuned)
@@ -2342,7 +2633,7 @@ KNOB_71:
 DEAD_CHECK_71:
 			cpi		R19, 5	; 
 			brlo	ENV_KNOBS		
-			sbr 	r18,1						
+			sbr 	r18,128						
 
 ;-------------------------------------------------------------------------------------------------------------------
 ; Knob 7 --> OSC A/B mix
@@ -2389,7 +2680,7 @@ KNOB_20:
 ;
 KNOB_30:			
 			lds	    R16, ADC_3
-			sbrc	R18, 3						; Check bit 1
+			sbrc	R18, 3						; Check bit 3
 			jmp		LOAD_ADC_30					; ADC_1 status bit is set, so just update parameter
 			mov		R19, R16
 			lds		R17, OLD_ADC_3
@@ -2399,7 +2690,7 @@ KNOB_30:
 DEAD_CHECK_30:
 			cpi		R19, 5				
 			brlo	KNOB_40			
-			sbr 	r18,1				
+			sbr 	r18,4				
 
 ;-------------------------------------------------------------------------------------------------------------------
 ; Knob 3 --> Sustain Level
@@ -2827,8 +3118,6 @@ MLP_KEYON1:
 			sts	    ENV_FRAC_L, R16		;\
 		    sts	    ENV_FRAC_H, R16		; > ENV = 0
 		    sts	    ENV_INTEGR, R16		;/
-
-; xyzzy - LFO keyboard sync check
 
 ; LFO starts (only when LFO KBD SYNC = on):
 		    lds	    R16, MODEFLAGS2
